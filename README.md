@@ -1,4 +1,4 @@
-# MW PBR Material V0.6.4
+# MW PBR Material V0.6.5
 
 MW PBR Material identifies a texture set and creates a clean Blender Principled
 BSDF material. Manual texture selection remains available for overrides.
@@ -7,7 +7,7 @@ V0.1 supports BaseColor, Metallic, Roughness, Normal, Opacity, Height, Ambient
 Occlusion, and Emissive maps. OpenGL normals are native. DirectX normals are
 converted non-destructively in the shader by flipping the green channel.
 
-Download `MW_PBR_Material_v0.6.4.zip` from the GitHub release and install it
+Download `MW_PBR_Material_v0.6.5.zip` from the GitHub release and install it
 through Blender's Extensions preferences using **Install from Disk**. The panel
 appears under **Material Properties > MW PBR Material**.
 
@@ -125,6 +125,9 @@ Roughness, `nor` for Normal, and `disp` for Height/Displacement. Abbreviated
 
 V0.6.4 is a behavior-neutral release used to verify the MW Blender Extensions
 update channel. Add-on functionality is unchanged from V0.6.3.
+
+V0.6.5 is a second behavior-neutral release used to verify automatic updates
+from V0.6.4 through the MW Blender Extensions repository.
 
 Auto recognises explicit NormalGL, NormalOpenGL, NormalDX, and NormalDirectX
 filename hints. DirectX maps are converted to the native OpenGL convention

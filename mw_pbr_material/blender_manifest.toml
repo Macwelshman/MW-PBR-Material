@@ -1,0 +1,9 @@
+schema_version = "1.0.0"
+id = "mw_pbr_material"
+version = "0.6.4"
+name = "MW PBR Material"
+tagline = "Detect texture sets and build clean PBR materials"
+maintainer = "MacWelshman"
+type = "add-on"
+blender_version_min = "5.0.0"
+license = ["SPDX:GPL-3.0-or-later"]

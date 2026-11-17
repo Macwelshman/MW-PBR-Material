@@ -39,8 +39,9 @@ def _make_active_mesh():
     return obj
 
 
-def run():
-    bpy.ops.wm.read_factory_settings(use_empty=True)
+def run(*, reset=True):
+    if reset:
+        bpy.ops.wm.read_factory_settings(use_empty=True)
     mw_pbr_material.register()
     obj = _make_active_mesh()
     settings = bpy.context.scene.mw_pbr_material

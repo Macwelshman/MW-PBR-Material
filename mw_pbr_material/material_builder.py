@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from array import array
+from functools import lru_cache
+import json
+
 import bpy
 
 
@@ -41,19 +45,61 @@ TEXTURE_NODE_NAMES = {
 STATE_PREFIX = "mw_pbr_state_"
 
 
-def _set_color_space(image: bpy.types.Image, texture_role: str) -> None:
-    """Set the Blender image datablock to the correct role-specific colour space."""
-    target = "sRGB" if texture_role in SRGB_TEXTURES else "Non-Color"
+@lru_cache(maxsize=2)
+def _configured_color_space(is_color):
+    """Resolve against Blender's active OCIO configuration, fixed at startup."""
+    probe = bpy.data.images.new("MW PBR colour space probe", 1, 1)
     try:
+        color = probe.colorspace_settings
+        if not is_color:
+            # Blender resolves this to the configured OCIO data role.
+            color.is_data = True
+            if color.is_data:
+                return color.name
+            raise RuntimeError("The active OpenColorIO configuration has no data colour space")
+
+        names = color.bl_rna.properties["name"].enum_items.keys()
+        candidates = ["sRGB"]
+        if "sRGB" not in names:
+            # Resolve OCIO aliases to their canonical RNA enum names.
+            import PyOpenColorIO as ocio
+
+            config = ocio.GetCurrentConfig()
+            for alias in ("srgb_rec709_scene", "srgb_texture", "Utility - sRGB - Texture"):
+                space = config.getColorSpace(alias)
+                if space:
+                    candidates.append(space.getName())
+        for name in candidates:
+            if name in names:
+                color.name = name
+                if not color.is_data:
+                    return name
+        # Blender 5.3 also exposes standardized interoperability identifiers.
+        if hasattr(color, "interop_id"):
+            for name in names:
+                color.name = name
+                if not color.is_data and color.interop_id == "srgb_rec709_scene":
+                    return name
+        raise RuntimeError("The active OpenColorIO configuration has no sRGB texture colour space")
+    finally:
+        bpy.data.images.remove(probe)
+
+
+def _target_color_space(image, role):
+    # Any existing space flagged as data is already suitable for a data map.
+    if role not in SRGB_TEXTURES and image.colorspace_settings.is_data:
+        return image.colorspace_settings.name
+    return _configured_color_space(role in SRGB_TEXTURES)
+
+
+def _set_color_space(image, texture_role):
+    target = _target_color_space(image, texture_role)
+    if image.colorspace_settings.name != target:
         image.colorspace_settings.name = target
-    except TypeError as exc:
-        raise RuntimeError(
-            f"{image.name!r} cannot use the required {target!r} colour space"
-        ) from exc
 
 
-def _image_node(nodes, links, image, texture_role, label, location, vector_output):
-    _set_color_space(image, texture_role)
+def _image_node(nodes, links, image, texture_role, label, location, vector_output, resolve_image):
+    image = resolve_image(image, texture_role)
     node = nodes.new("ShaderNodeTexImage")
     node.name = f"MW {label} Texture"
     node.label = label
@@ -115,11 +161,7 @@ def _input(node, name):
 
 
 def _configure_opacity(material: bpy.types.Material) -> None:
-    """Use Blender's current transparent-surface setting with a legacy fallback."""
-    if hasattr(material, "surface_render_method"):
-        material.surface_render_method = "DITHERED"
-    elif hasattr(material, "blend_method"):
-        material.blend_method = "HASHED"
+    material.surface_render_method = "DITHERED"
 
 
 def _connect_material_surface(material, nodes, links, principled, output):
@@ -196,38 +238,26 @@ def _material_pointer_token(material):
     return str(material.as_pointer()) if material else ""
 
 
+STATE_FIELDS = (
+    "texture_folder", "scan_status", "auto_load_companions",
+    "detected_normal_convention", "normal_interpretation", "texture_scale",
+    "base_color_brightness", "emission_strength", "displacement_amount",
+)
+
+
 def store_material_state(material, settings):
-    material[f"{STATE_PREFIX}texture_folder"] = settings.texture_folder
-    material[f"{STATE_PREFIX}scan_status"] = settings.scan_status
-    material[f"{STATE_PREFIX}auto_load_companions"] = bool(
-        settings.auto_load_companions
-    )
-    material[f"{STATE_PREFIX}detected_normal_convention"] = (
-        settings.detected_normal_convention
-    )
-    material[f"{STATE_PREFIX}normal_interpretation"] = (
-        settings.normal_interpretation
-    )
-    material[f"{STATE_PREFIX}texture_scale"] = float(settings.texture_scale)
-    material[f"{STATE_PREFIX}base_color_brightness"] = float(
-        settings.base_color_brightness
-    )
-    material[f"{STATE_PREFIX}emission_strength"] = float(
-        settings.emission_strength
-    )
-    material[f"{STATE_PREFIX}displacement_amount"] = float(
-        settings.displacement_amount
-    )
+    for key in STATE_FIELDS:
+        material[STATE_PREFIX + key] = getattr(settings, key)
     settings.synced_material_pointer = _material_pointer_token(material)
 
 
 def _image_from_material(material, role):
-    node = material.node_tree.nodes.get(TEXTURE_NODE_NAMES[role])
+    node = owned_nodes(material).get(TEXTURE_NODE_NAMES[role])
     return getattr(node, "image", None) if node else None
 
 
 def _legacy_texture_scale(material):
-    node = material.node_tree.nodes.get("MW Texture Scale")
+    node = owned_nodes(material).get("MW Texture Scale")
     if node is None:
         return 1.0
     frequency = float(node.inputs["Scale"].default_value[0])
@@ -235,7 +265,7 @@ def _legacy_texture_scale(material):
 
 
 def _legacy_base_color_brightness(material):
-    node = material.node_tree.nodes.get("MW BaseColor Brightness")
+    node = owned_nodes(material).get("MW BaseColor Brightness")
     if node is None:
         return 0.0
     if node.blend_type == "MULTIPLY":
@@ -244,17 +274,17 @@ def _legacy_base_color_brightness(material):
 
 
 def _legacy_emission_strength(material):
-    node = material.node_tree.nodes.get("MW Principled BSDF")
+    node = owned_nodes(material).get("MW Principled BSDF")
     if node is None:
         return 0.0
     return float(_input(node, "Emission Strength").default_value)
 
 
 def _legacy_displacement_amount(material):
-    bump = material.node_tree.nodes.get("MW Height Bump")
+    bump = owned_nodes(material).get("MW Height Bump")
     if bump is not None:
         return float(bump.inputs["Strength"].default_value)
-    displacement = material.node_tree.nodes.get("MW Height Displacement")
+    displacement = owned_nodes(material).get("MW Height Displacement")
     if displacement is not None:
         return float(displacement.inputs["Scale"].default_value)
     return 1.0
@@ -283,7 +313,7 @@ def sync_settings_from_material(settings, material, force=False):
 
     normal_interpretation = material.get(
         f"{STATE_PREFIX}normal_interpretation",
-        "DIRECTX" if "MW Flip DirectX Green" in material.node_tree.nodes else "AUTO",
+        "DIRECTX" if "MW Flip DirectX Green" in owned_nodes(material) else "AUTO",
     )
     if normal_interpretation not in {"AUTO", "OPENGL", "DIRECTX"}:
         normal_interpretation = "AUTO"
@@ -336,17 +366,7 @@ def sync_settings_from_material(settings, material, force=False):
     return True
 
 
-def build_material(settings, material=None) -> bpy.types.Material:
-    """Create or rebuild a material from the current texture settings."""
-    material_name = settings.material_name.strip() or "PBR Material"
-    if material is None:
-        material = bpy.data.materials.new(name=material_name)
-    elif not is_mw_material(material):
-        raise ValueError("The active material was not created by MW PBR Material")
-
-    material[MW_PBR_MATERIAL_KEY] = True
-    material.use_nodes = True
-
+def _generate(settings, material, resolve_image):
     nodes = material.node_tree.nodes
     links = material.node_tree.links
     nodes.clear()
@@ -382,7 +402,7 @@ def build_material(settings, material=None) -> bpy.types.Material:
             "base_color",
             "BaseColor",
             (-900, 320),
-            vector_output,
+            vector_output, resolve_image,
         )
         base_color_output = _build_base_color_brightness(
             nodes,
@@ -399,7 +419,7 @@ def build_material(settings, material=None) -> bpy.types.Material:
             "ambient_occlusion",
             "Ambient Occlusion",
             (-900, 100),
-            vector_output,
+            vector_output, resolve_image,
         )
         ao_multiply = nodes.new("ShaderNodeMixRGB")
         ao_multiply.name = "MW AO BaseColor Multiply"
@@ -425,7 +445,7 @@ def build_material(settings, material=None) -> bpy.types.Material:
         image = getattr(settings, role)
         if image:
             image_node = _image_node(
-                nodes, links, image, role, label, location, vector_output
+                nodes, links, image, role, label, location, vector_output, resolve_image
             )
             links.new(image_node.outputs["Color"], _input(principled, socket_name))
 
@@ -438,7 +458,7 @@ def build_material(settings, material=None) -> bpy.types.Material:
             "normal",
             "Normal",
             (-900, -440),
-            vector_output,
+            vector_output, resolve_image,
         )
         interpretation = (
             settings.detected_normal_convention
@@ -459,7 +479,7 @@ def build_material(settings, material=None) -> bpy.types.Material:
             "height",
             "Height",
             (-900, -700),
-            vector_output,
+            vector_output, resolve_image,
         )
         displacement_method = getattr(material, "displacement_method", "BUMP")
         if displacement_method in {"BUMP", "BOTH"}:
@@ -498,7 +518,7 @@ def build_material(settings, material=None) -> bpy.types.Material:
             "opacity",
             "Opacity",
             (-900, -920),
-            vector_output,
+            vector_output, resolve_image,
         )
         links.new(opacity_node.outputs["Color"], _input(principled, "Alpha"))
         _configure_opacity(material)
@@ -511,7 +531,7 @@ def build_material(settings, material=None) -> bpy.types.Material:
             "emissive",
             "Emissive",
             (-900, -1100),
-            vector_output,
+            vector_output, resolve_image,
         )
         _input(principled, "Emission Strength").default_value = (
             settings.emission_strength
@@ -520,5 +540,371 @@ def build_material(settings, material=None) -> bpy.types.Material:
             emissive_node.outputs["Color"], _input(principled, "Emission Color")
         )
 
-    store_material_state(material, settings)
-    return material
+
+NODE_ROLE = "mw_pbr_node_role"
+GRAPH_LINKS = "mw_pbr_generated_links"
+
+_NODE_TYPES = {
+    **dict.fromkeys(TEXTURE_NODE_NAMES.values(), "ShaderNodeTexImage"),
+    "MW Material Output": "ShaderNodeOutputMaterial",
+    "MW Principled BSDF": "ShaderNodeBsdfPrincipled",
+    "MW Texture Coordinate": "ShaderNodeTexCoord",
+    "MW Texture Scale": "ShaderNodeMapping",
+    "MW BaseColor Brightness": "ShaderNodeMixRGB",
+    "MW AO BaseColor Multiply": "ShaderNodeMixRGB",
+    "MW Backface Geometry": "ShaderNodeNewGeometry",
+    "MW Backface Transparent": "ShaderNodeBsdfTransparent",
+    "MW Backface Mix": "ShaderNodeMixShader",
+    "MW OpenGL Normal Map": "ShaderNodeNormalMap",
+    "MW Separate DirectX Normal": "ShaderNodeSeparateColor",
+    "MW Flip DirectX Green": "ShaderNodeMath",
+    "MW Combine OpenGL Normal": "ShaderNodeCombineColor",
+    "MW Height Bump": "ShaderNodeBump",
+    "MW Height Displacement": "ShaderNodeDisplacement",
+}
+
+
+def owned_nodes(material):
+    """Resolve persistent roles; recognize the original graph on legacy materials."""
+    if not is_mw_material(material) or not material.node_tree:
+        return {}
+    modern = GRAPH_LINKS in material
+    result = {}
+    for node in material.node_tree.nodes:
+        role = node.get(NODE_ROLE) if modern else node.name
+        if _NODE_TYPES.get(role) == node.bl_idname:
+            result.setdefault(role, node)
+    return result
+
+
+def _link_key(link, roles):
+    return (roles.get(link.from_node), link.from_socket.identifier,
+            roles.get(link.to_node), link.to_socket.identifier)
+
+
+def _legacy_generated(link, key, wanted):
+    """Legacy files have no link manifest. Recognize the original shader routes."""
+    if key in wanted:
+        return True
+    source, output_id, target, input_id = key
+    routes = {
+        ("MW Texture Coordinate", "MW Texture Scale", "Vector"),
+        ("MW Principled BSDF", "MW Material Output", "Surface"),
+        ("MW Backface Mix", "MW Material Output", "Surface"),
+        ("MW Backface Geometry", "MW Backface Mix", "Fac"),
+        ("MW BaseColor Brightness", "MW Principled BSDF", "Base Color"),
+        ("MW AO BaseColor Multiply", "MW Principled BSDF", "Base Color"),
+        ("MW Height Bump", "MW Principled BSDF", "Normal"),
+        ("MW OpenGL Normal Map", "MW Principled BSDF", "Normal"),
+        ("MW OpenGL Normal Map", "MW Height Bump", "Normal"),
+        ("MW Height Displacement", "MW Material Output", "Displacement"),
+        ("MW Flip DirectX Green", "MW Combine OpenGL Normal", "Green"),
+        ("MW Combine OpenGL Normal", "MW OpenGL Normal Map", "Color"),
+        ("MW BaseColor Brightness", "MW AO BaseColor Multiply", "Color1"),
+    }
+    texture_targets = {
+        "base_color": {("MW BaseColor Brightness", "Color1")},
+        "ambient_occlusion": {("MW AO BaseColor Multiply", "Color2")},
+        "metallic": {("MW Principled BSDF", "Metallic")},
+        "roughness": {("MW Principled BSDF", "Roughness")},
+        "normal": {("MW Separate DirectX Normal", "Color"), ("MW OpenGL Normal Map", "Color")},
+        "height": {("MW Height Bump", "Height"), ("MW Height Displacement", "Height")},
+        "opacity": {("MW Principled BSDF", "Alpha")},
+        "emissive": {("MW Principled BSDF", "Emission Color")},
+    }
+    # These legacy nodes have repeated socket names. Match the actual
+    # generated sockets so an artist's alternate routing stays untouched.
+    if target == "MW Backface Mix" and source in {"MW Backface Transparent", "MW Principled BSDF"}:
+        return link.to_socket == link.to_node.inputs[2 if source == "MW Backface Transparent" else 1]
+    if target == "MW Flip DirectX Green" and source == "MW Separate DirectX Normal":
+        return output_id == "Green" and link.to_socket == link.to_node.inputs[1]
+    if target == "MW Combine OpenGL Normal" and source == "MW Separate DirectX Normal":
+        return output_id == input_id and input_id in {"Red", "Blue"}
+    socket = link.to_socket.name
+    if source == "MW Texture Scale" and target in TEXTURE_NODE_NAMES.values():
+        return socket == "Vector"
+    return (source, target, socket) in routes or any(
+        source == TEXTURE_NODE_NAMES[role] and (target, socket) in targets
+        for role, targets in texture_targets.items()
+    )
+
+
+# Only these values are driven by MW controls on an existing node.
+_MANAGED_INPUTS = {
+    "MW Texture Scale": ("Scale",),
+    "MW BaseColor Brightness": (0, 2),
+    "MW Principled BSDF": ("Emission Color", "Emission Strength"),
+    "MW Height Bump": ("Strength",),
+    "MW Height Displacement": ("Scale",),
+}
+_NODE_ATTRIBUTES = {
+    "ShaderNodeTexImage": ("image",),
+    "ShaderNodeMapping": ("vector_type",),
+    "ShaderNodeMixRGB": ("blend_type",),
+    "ShaderNodeSeparateColor": ("mode",),
+    "ShaderNodeCombineColor": ("mode",),
+    "ShaderNodeMath": ("operation",),
+}
+
+_VARIANT_SOURCE = "mw_pbr_variant_source"
+
+
+def _file_identity(image):
+    # Dirty and packed images can have different pixels despite the same path.
+    if image.source == "FILE" and image.filepath and not image.is_dirty and not image.packed_files:
+        return (bpy.path.abspath(image.filepath, library=image.library), image.alpha_mode,
+                image.use_multiview)
+    return None
+
+
+def _image_has_other_users(image, users):
+    """Exempt only MW's texture picker references, not other scene image users."""
+    picker_users = 0
+    for user in users:
+        if not isinstance(user, bpy.types.Scene):
+            return True
+        picker = getattr(user, "mw_pbr_material", None)
+        if picker is not None:
+            picker_users += sum(getattr(picker, role) == image for role in TEXTURE_ROLES)
+    return image.users > picker_users
+
+
+def build_material(settings, material=None, *, rebuild=False):
+    """Stage generation, then apply a journaled graph update to the same material."""
+    creating = material is None
+    if not creating and (not is_mw_material(material) or not material.is_editable):
+        raise ValueError("Select an editable MW PBR material")
+    from .texture_detection import settings_update_guard
+
+    stage = bpy.data.materials.new("MW PBR staging")
+    created_images = []
+    color_changes = []
+    variants = {}
+    undo = []
+
+    def resolve_image(image, role):
+        target = _target_color_space(image, role)
+        original_space = image.colorspace_settings.name
+        if original_space == target:
+            return image
+        key = (image, target)
+        if key not in variants:
+            identity = _file_identity(image)
+            root = image.get(_VARIANT_SOURCE) if identity else None
+            root = root if isinstance(root, bpy.types.Image) and _file_identity(root) == identity else image
+            user_map = bpy.data.user_map(subset={image, root})
+            if identity:
+                # Only reuse a copy we created from this very datablock. An
+                # unrelated import of the same path can have different settings.
+                for candidate in (root, *user_map.get(root, ())):
+                    if (isinstance(candidate, bpy.types.Image)
+                            and (candidate == root or candidate.get(_VARIANT_SOURCE) == root)
+                            and _file_identity(candidate) == identity
+                            and candidate.colorspace_settings.name == target):
+                        variants[key] = candidate
+                        return candidate
+            if (not image.is_editable or image.is_dirty
+                    or _image_has_other_users(image, user_map.get(image, ()))
+                    or any(source == image and _target_color_space(source, slot) == original_space
+                           for slot, source in requested.items())):
+                source = image
+                image = image.copy()
+                created_images.append(image)
+                image.use_fake_user = False
+                if _VARIANT_SOURCE in image:
+                    del image[_VARIANT_SOURCE]
+                if source.library and source.filepath.startswith("//"):
+                    image.filepath = bpy.path.abspath(source.filepath, library=source.library)
+                image.colorspace_settings.name = target
+                if identity:
+                    image[_VARIANT_SOURCE] = root
+                if source.is_dirty:
+                    # Blender's Image.copy does not copy unsaved image buffers.
+                    if (source.source not in {"FILE", "GENERATED"}
+                            or source.type not in {"IMAGE", "UV_TEST"}):
+                        raise RuntimeError(f"Save {source.name!r} before using it in another colour space")
+                    pixels = array("f", [0.0]) * len(source.pixels)
+                    source.pixels.foreach_get(pixels)
+                    if not pixels or len(image.pixels) != len(pixels):
+                        raise RuntimeError(f"Could not copy the unsaved pixels of {source.name!r}")
+                    image.pixels.foreach_set(pixels)
+                    image.update()
+                    image.pack()
+            else:
+                color_changes.append((image, original_space))
+                image.colorspace_settings.name = target
+            variants[key] = image
+        return variants[key]
+
+    def assign(obj, attr, value):
+        previous = getattr(obj, attr)
+        if hasattr(previous, "to_tuple"):
+            previous = previous.to_tuple()
+        elif hasattr(previous, "__len__") and not isinstance(previous, (str, bpy.types.ID)):
+            previous = tuple(previous)
+        if previous != value:
+            undo.append(lambda: setattr(obj, attr, previous))
+            setattr(obj, attr, value)
+
+    def prop(obj, key, value):
+        existed = key in obj
+        previous = obj.get(key)
+        def restore():
+            if existed:
+                obj[key] = previous
+            elif key in obj:
+                del obj[key]
+        undo.append(restore)
+        obj[key] = value
+
+    try:
+        requested = {role: getattr(settings, role) for role in TEXTURE_ROLES}
+        if material:
+            stage.use_backface_culling = material.use_backface_culling
+            stage.displacement_method = material.displacement_method
+        _generate(settings, stage, resolve_image)
+        desired = {node.name: node for node in stage.node_tree.nodes}
+        desired_roles = {node: role for role, node in desired.items()}
+        desired_links = [_link_key(link, desired_roles) for link in stage.node_tree.links]
+        if creating:
+            material = stage
+            material.name = settings.material_name.strip() or "PBR Material"
+            for role, node in desired.items():
+                node[NODE_ROLE] = role
+            actual = desired
+            installed_links = desired_links
+        else:
+            tree = material.node_tree
+            nodes, links = tree.nodes, tree.links
+            original = list(nodes)
+            active = nodes.active
+            active_outputs = [n for n in nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output]
+            selected = [(n, n.select) for n in original]
+            def restore_editor_state():
+                for n, value in selected:
+                    n.select = value
+                nodes.active = active
+                for n in active_outputs:
+                    n.is_active_output = True
+            undo.append(restore_editor_state)
+
+            old = owned_nodes(material) if not rebuild else {}
+            old_roles = {node: role for role, node in old.items()}
+            previous_links = {tuple(key) for key in json.loads(material.get(GRAPH_LINKS, "[]"))}
+            wanted = set(desired_links)
+            obsolete = set(original if rebuild else (n for role, n in old.items() if role not in desired))
+            managed = {}
+            protected_inputs = set()
+            protected_nodes = set()
+            if not rebuild:
+                for link in links:
+                    key = _link_key(link, old_roles)
+                    if (key in previous_links if GRAPH_LINKS in material
+                            else _legacy_generated(link, key, wanted)):
+                        managed[key] = link
+                    else:
+                        protected_inputs.add(link.to_socket)
+                        protected_nodes.update((link.from_node, link.to_node))
+                # A custom link or a custom frame can still use a retired MW node.
+                for node in obsolete & (protected_nodes | {n for n in obsolete if n.parent}):
+                    if NODE_ROLE in node:
+                        previous = node[NODE_ROLE]
+                        undo.append(lambda n=node, value=previous: n.__setitem__(NODE_ROLE, value))
+                        del node[NODE_ROLE]
+                    obsolete.remove(node)
+
+            actual = {}
+            for role, template in desired.items():
+                node = old.get(role)
+                new = node is None
+                if new:
+                    node = nodes.new(template.bl_idname)
+                    undo.append(lambda n=node: nodes.remove(n))
+                    node.name = "MW PBR pending" if rebuild else role
+                    node.label = template.label
+                    node.location = template.location
+                    node.select = False
+                actual[role] = node
+                prop(node, NODE_ROLE, role)
+                for attr in _NODE_ATTRIBUTES.get(template.bl_idname, ()):
+                    if new or attr == "image" or role == "MW BaseColor Brightness":
+                        assign(node, attr, getattr(template, attr))
+                inputs = _MANAGED_INPUTS.get(role, ())
+                if role == "MW Principled BSDF" and not (
+                        settings.emissive or TEXTURE_NODE_NAMES["emissive"] in old):
+                    inputs = ()
+                if new:
+                    inputs = [i for i, socket in enumerate(template.inputs)
+                              if hasattr(socket, "default_value")]
+                for i in inputs:
+                    socket = node.inputs[i]
+                    if socket not in protected_inputs:
+                        assign(socket, "default_value", template.inputs[i].default_value)
+
+            for key, link in managed.items():
+                if key not in wanted:
+                    src, dst, muted = link.from_socket, link.to_socket, link.is_muted
+                    def restore_link(s=src, d=dst, m=muted):
+                        links.new(s, d, verify_limits=False).is_muted = m
+                    undo.append(restore_link)
+                    links.remove(link)
+            installed_links = []
+            for key in desired_links:
+                source, i, target, j = key
+                src = next(s for s in actual[source].outputs if s.identifier == i)
+                dst = next(s for s in actual[target].inputs if s.identifier == j)
+                if dst in protected_inputs:
+                    continue
+                if key not in managed:
+                    link = links.new(src, dst, verify_limits=False)
+                    undo.append(lambda edge=link: links.remove(edge))
+                installed_links.append(key)
+
+            if rebuild or not active_outputs:
+                actual["MW Material Output"].is_active_output = True
+            else:
+                restore_editor_state()
+            if rebuild:
+                for role in actual:
+                    previous = nodes.get(role)
+                    if previous in obsolete:
+                        assign(previous, "name", "MW PBR retired")
+                for role, node in actual.items():
+                    assign(node, "name", role)
+
+        prop(material, MW_PBR_MATERIAL_KEY, True)
+        prop(material, GRAPH_LINKS, json.dumps(installed_links))
+        if settings.opacity or stage.use_backface_culling:
+            assign(material, "surface_render_method", stage.surface_render_method)
+        with settings_update_guard(settings):
+            for role, name in TEXTURE_NODE_NAMES.items():
+                if name in actual:
+                    assign(settings, role, actual[name].image)
+            for key in STATE_FIELDS:
+                prop(material, STATE_PREFIX + key, getattr(settings, key))
+            assign(settings, "synced_material_pointer", _material_pointer_token(material))
+        if not creating:
+            # All fallible generation and assignments precede removal. These
+            # are valid nodes in a verified editable local node tree.
+            for node in obsolete:
+                nodes.remove(node)
+        return material
+    except Exception as exc:
+        with settings_update_guard(settings):
+            for restore in reversed(undo):
+                try:
+                    restore()
+                except Exception as rollback_error:
+                    exc.add_note(f"Could not restore a material value: {rollback_error}")
+        for image, color_space in reversed(color_changes):
+            try:
+                image.colorspace_settings.name = color_space
+            except Exception as rollback_error:
+                exc.add_note(f"Could not restore {image.name!r}: {rollback_error}")
+        raise
+    finally:
+        if not creating or material != stage or not is_mw_material(stage):
+            bpy.data.materials.remove(stage)
+        for image in created_images:
+            if not image.users:
+                bpy.data.images.remove(image)

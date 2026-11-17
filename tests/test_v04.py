@@ -22,8 +22,9 @@ def _linked_from(material, target_node_name, target_socket_name):
     return links[0].from_node
 
 
-def run():
-    bpy.ops.wm.read_factory_settings(use_empty=True)
+def run(*, reset=True):
+    if reset:
+        bpy.ops.wm.read_factory_settings(use_empty=True)
     mw_pbr_material.register()
 
     mesh = bpy.data.meshes.new("MW V0.4 Test Mesh")

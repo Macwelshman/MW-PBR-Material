@@ -1,13 +1,13 @@
-# MW PBR Material V0.6.5
+# MW PBR Material V0.6.6
 
 MW PBR Material identifies a texture set and creates a clean Blender Principled
 BSDF material. Manual texture selection remains available for overrides.
 
-V0.1 supports BaseColor, Metallic, Roughness, Normal, Opacity, Height, Ambient
+Supported maps are BaseColor, Metallic, Roughness, Normal, Opacity, Height, Ambient
 Occlusion, and Emissive maps. OpenGL normals are native. DirectX normals are
 converted non-destructively in the shader by flipping the green channel.
 
-Download `MW_PBR_Material_v0.6.5.zip` from the GitHub release and install it
+Download `MW_PBR_Material_v0.6.6.zip` from the GitHub release and install it
 through Blender's Extensions preferences using **Install from Disk**. The panel
 appears under **Material Properties > MW PBR Material**.
 
@@ -26,9 +26,22 @@ not tracked in this source repository.
 6. Override any texture or choose **OpenGL**/**DirectX** when necessary.
 
 The texture interface is only shown while an MW-created material is active.
-Texture changes rebuild that material in place. **Remove All** clears every slot
-and returns the material to a clean Principled setup without deleting images or
-source files.
+Texture changes update the MW nodes in place. **Update Material** refreshes the
+generated shader while preserving artist nodes, custom links, and settings
+outside the MW controls. **Rebuild Material** starts over from the current MW
+settings and asks for confirmation before replacing the whole shader graph.
+Both actions prepare the new graph before editing the current material. If
+generation or application fails, the existing graph and material settings are
+kept.
+**Remove All** clears the MW texture slots without deleting images or source files.
+
+BaseColor and Emissive use sRGB; the other maps use a data colour space. If a
+shared image needs a different interpretation, MW uses an independent
+datablock and reuses compatible copies of unchanged, unpacked file images.
+Source files are never changed. With a custom OpenColorIO configuration, MW
+uses the configured data role and recognises an sRGB texture space by its
+name, supported alias, or Blender's interoperability identifier. If the
+required space cannot be resolved, the build stops and reports the problem.
 
 Each new **Create PBR Material** action starts with an empty texture folder and
 empty source slots. Materials display through their complete shader in Blender's
@@ -71,6 +84,10 @@ mixing the first alphabetical map of each type in a folder. Manually choosing a
 texture anchors companion loading to that exact set. When both normal variants
 exist, folder scanning prefers native OpenGL unless the selected file explicitly
 chooses DirectX.
+
+The exact image datablock you picked stays selected when companions load.
+A filename that does not match the selected slot, or an image whose source file
+is missing, remains a manual choice and does not trigger a companion scan.
 
 ## V0.4 BaseColor brightness
 
@@ -123,6 +140,10 @@ V0.6.3 recognises the abbreviated suffixes `diff` for BaseColor, `rough` for
 Roughness, `nor` for Normal, and `disp` for Height/Displacement. Abbreviated
 `nor_gl` and `nor_dx` filenames retain automatic normal-convention detection.
 
+V0.6.6 adds non-destructive material updates, an explicit rebuild confirmation,
+and a preview for relinking missing textures. Shared images keep their original
+colour space when another role needs a separate datablock.
+
 V0.6.4 is a behavior-neutral release used to verify the MW Blender Extensions
 update channel. Add-on functionality is unchanged from V0.6.3.
 
@@ -154,6 +175,27 @@ AO/Occlusion, and Emissive/Emission. Alias definitions are centralized in
 - `tests/test_v04.py` — BaseColor brightness runtime test
 - `tests/test_v05.py` — per-material slot-state runtime test
 - `tests/test_v06.py` — height displacement-mode runtime test
+- `tests/test_relink.py` — missing-file matching and relink rollback
+- `tests/test_safe_updates.py` — graph ownership, shared images, rollback, and save/reopen
+- `tests/test_material_safety.py` — variant reuse, manual overrides, scene image references, and Undo/Redo
+
+To run the suite on macOS with Flue installed:
+
+```sh
+python3 tests/run_flue.py "/Applications/Blender.app"
+python3 tests/run_flue.py "/Applications/Blender.app" --custom-ocio
+```
+
+The runner tests a disposable Blender session. The custom configuration
+renames the sRGB and data spaces while retaining their transforms and roles.
 
 Workflow inference, Glossiness/Specular support, confidence scoring, ambiguity
 warnings, and advanced controls remain reserved for later stages.
+
+### Relink missing textures
+
+If external image files have moved, select the MW material and click **Relink Texture Set** in Material Properties. Choose the replacement folder in the dialog. Relink searches that folder, the stored texture folder, and the original directories of the missing files. It does not search subfolders.
+
+Review the original path and suggested replacement before confirming. A matching filename has high confidence; a matching material-set name and map type has medium confidence. Equal-confidence matches are shown and skipped, as are maps with no match. To resolve a tie, put the intended files in a separate folder and remove the competing files from the search locations, or restore the exact original file.
+
+Relink changes the image references in the material’s own shader tree, including custom image nodes. It preserves node links, mapping and shader controls, including the existing OpenGL/DirectX setup. Packed images, generated images, UDIMs, sequences, movies and images inside node groups are outside this operation. Source files and image datablocks used by other materials are left alone.

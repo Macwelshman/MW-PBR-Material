@@ -1,15 +1,16 @@
 """User-facing operations for MW PBR Material."""
 
 import bpy
-from bpy.props import EnumProperty
+from bpy.props import EnumProperty, StringProperty
 from bpy.types import Operator
 
 from .material_builder import (
     TEXTURE_ROLES,
-    _set_color_space,
     build_material,
     is_mw_material,
+    sync_settings_from_material,
 )
+from .relink import apply_relinks, missing_images, suggestions
 from .texture_detection import (
     clear_texture_settings,
     scan_settings_folder,
@@ -93,11 +94,15 @@ class MWPBR_OT_RemoveAllTextures(Operator):
     def execute(self, context):
         settings = context.scene.mw_pbr_material
         obj = context.active_object
-        clear_texture_settings(
-            settings,
-            material=getattr(obj, "active_material", None),
-            clear_folder=False,
-        )
+        try:
+            clear_texture_settings(
+                settings,
+                material=getattr(obj, "active_material", None),
+                clear_folder=False,
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         self.report({"INFO"}, "Removed all textures")
         return {"FINISHED"}
 
@@ -114,8 +119,12 @@ class MWPBR_OT_ToggleBackfaces(Operator):
             self.report({"ERROR"}, "Select an MW PBR material")
             return {"CANCELLED"}
 
-        material.use_backface_culling = not material.use_backface_culling
-        build_material(context.scene.mw_pbr_material, material=material)
+        previous = material.use_backface_culling
+        material.use_backface_culling = not previous
+        result = _refresh_material(self, context, rebuild=False)
+        if result == {"CANCELLED"}:
+            material.use_backface_culling = previous
+            return result
         state = "hidden" if material.use_backface_culling else "visible"
         self.report({"INFO"}, f"Backfaces are {state}")
         return {"FINISHED"}
@@ -135,7 +144,14 @@ class MWPBR_OT_SetNormalConvention(Operator):
     )
 
     def execute(self, context):
-        context.scene.mw_pbr_material.normal_interpretation = self.convention
+        settings = context.scene.mw_pbr_material
+        material = getattr(context.active_object, "active_material", None)
+        with settings_update_guard(settings):
+            if is_mw_material(material):
+                sync_settings_from_material(settings, material)
+            settings.normal_interpretation = self.convention
+        if is_mw_material(material):
+            return _refresh_material(self, context, rebuild=False)
         return {"FINISHED"}
 
 
@@ -166,9 +182,12 @@ class MWPBR_OT_SetDisplacementMethod(Operator):
         if not is_mw_material(material):
             self.report({"ERROR"}, "Select an MW PBR material")
             return {"CANCELLED"}
+        previous = material.displacement_method
         material.displacement_method = self.method
-        build_material(context.scene.mw_pbr_material, material=material)
-        return {"FINISHED"}
+        result = _refresh_material(self, context, rebuild=False)
+        if result == {"CANCELLED"}:
+            material.displacement_method = previous
+        return result
 
 
 class MWPBR_OT_NormalUncertaintyHint(Operator):
@@ -239,7 +258,6 @@ class MWPBR_OT_ReloadAllTextures(Operator):
                 continue
             try:
                 image.reload()
-                _set_color_space(image, role)
                 reloaded += 1
             except RuntimeError:
                 failures.append(image.name)
@@ -254,7 +272,126 @@ class MWPBR_OT_ReloadAllTextures(Operator):
         return {"FINISHED"}
 
 
+class MWPBR_OT_UpdateMaterial(Operator):
+    bl_idname = "mw_pbr.update_material"
+    bl_label = "Update Material"
+    bl_description = "Refresh MW nodes while preserving custom nodes and links"
+    bl_options = {"UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        material = getattr(context.object, "active_material", None)
+        return is_mw_material(material) and material.is_editable
+
+    def execute(self, context):
+        return _refresh_material(self, context, rebuild=False)
+
+
+class MWPBR_OT_RebuildMaterial(Operator):
+    bl_idname = "mw_pbr.rebuild_material"
+    bl_label = "Rebuild Material"
+    bl_description = "Replace the entire shader graph, including custom nodes and links"
+    bl_options = {"UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return MWPBR_OT_UpdateMaterial.poll(context)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(
+            self, event, title="Rebuild Material?",
+            message="Custom nodes, links and node settings will be lost.",
+            confirm_text="Rebuild", icon="WARNING",
+        )
+
+    def execute(self, context):
+        return _refresh_material(self, context, rebuild=True)
+
+
+def _refresh_material(operator, context, *, rebuild):
+    material = context.object.active_material
+    settings = context.scene.mw_pbr_material
+    sync_settings_from_material(settings, material)
+    try:
+        build_material(settings, material, rebuild=rebuild)
+    except Exception as exc:
+        sync_settings_from_material(settings, material, force=True)
+        operator.report({"ERROR"}, f"Material was not changed: {exc}")
+        return {"CANCELLED"}
+    return {"FINISHED"}
+
+
+class MWPBR_OT_RelinkTextureSet(Operator):
+    bl_idname = "mw_pbr.relink_texture_set"
+    bl_label = "Relink Texture Set"
+    bl_description = "Review replacement files for missing textures in this material"
+    bl_options = {"UNDO"}
+
+    directory: StringProperty(name="Replacement Folder", subtype="DIR_PATH",
+                              options={"SKIP_SAVE"})
+
+    @classmethod
+    def poll(cls, context):
+        material = getattr(context.object, "active_material", None)
+        return is_mw_material(material) and material.is_editable
+
+    def invoke(self, context, event):
+        self._material = context.object.active_material
+        self._reviewed = None
+        return context.window_manager.invoke_props_dialog(
+            self, width=760, confirm_text="Relink Suggested Files"
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "directory")
+        layout.label(text="Also searches the original texture folders.")
+        rows = suggestions(self._material, self.directory)
+        self._reviewed = (self.directory, rows)
+        for node, _, original, candidates, score in rows:
+            box = layout.box()
+            if len(candidates) > 1:
+                status = "Ambiguous — skipped"
+            elif not candidates:
+                status = "No match — skipped"
+            else:
+                status = "High: same filename" if score == 2 else "Medium: same set and map type"
+            box.label(text=f"{node.label or node.name} · {status}")
+            box.label(text=f"Original: {original}")
+            for path in candidates:
+                box.label(text=f"{'Candidate' if len(candidates) > 1 else 'Replacement'}: {path}")
+        if not rows:
+            layout.label(text="No missing external image files.")
+
+    def execute(self, context):
+        material = context.object.active_material
+        if (getattr(self, "_material", None) != material
+                or getattr(self, "_reviewed", None) is None):
+            self.report({"WARNING"}, "Open the relink dialog to review replacements first")
+            return {"CANCELLED"}
+        rows = suggestions(material, self.directory)
+        if self._reviewed != (self.directory, rows):
+            self.report({"WARNING"}, "Texture matches changed. Open Relink again to review them")
+            return {"CANCELLED"}
+        try:
+            settings = context.scene.mw_pbr_material
+            sync_settings_from_material(settings, material)
+            count = apply_relinks(settings, rows, material)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        if not count:
+            self.report({"WARNING"}, "No unambiguous replacements found")
+            return {"CANCELLED"}
+        remaining = len(missing_images(material))
+        self.report({"INFO"}, f"Relinked {count} texture reference(s); {remaining} still missing")
+        return {"FINISHED"}
+
+
 _CLASSES = (
+    MWPBR_OT_UpdateMaterial,
+    MWPBR_OT_RebuildMaterial,
+    MWPBR_OT_RelinkTextureSet,
     MWPBR_OT_CreateMaterial,
     MWPBR_OT_ScanTextureFolder,
     MWPBR_OT_ToggleBackfaces,

@@ -3,7 +3,7 @@
 bl_info = {
     "name": "MW PBR Material",
     "author": "MacWelshman",
-    "version": (0, 6, 5),
+    "version": (0, 6, 6),
     "blender": (5, 0, 0),
     "location": "Properties > Material > MW PBR Material",
     "description": "Build clean Principled PBR materials from manually selected textures",

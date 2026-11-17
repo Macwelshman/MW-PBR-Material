@@ -39,8 +39,9 @@ def _write_png(path):
     bpy.data.images.remove(image)
 
 
-def run():
-    bpy.ops.wm.read_factory_settings(use_empty=True)
+def run(*, reset=True, color="sRGB"):
+    if reset:
+        bpy.ops.wm.read_factory_settings(use_empty=True)
     mw_pbr_material.register()
     assert ui._ICON_PREVIEWS is not None
     assert "green_check" in ui._ICON_PREVIEWS
@@ -109,7 +110,7 @@ def run():
         _write_png(image_path)
         settings.base_color = bpy.data.images.load(str(image_path))
         assert bpy.ops.mw_pbr.reload_all_textures() == {"FINISHED"}
-        assert settings.base_color.colorspace_settings.name == "sRGB"
+        assert settings.base_color.colorspace_settings.name == color
 
     settings.emissive = bpy.data.images.new("MW Emissive Strength", 4, 4)
     settings.emission_strength = 2.5

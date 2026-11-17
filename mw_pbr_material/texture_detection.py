@@ -279,17 +279,21 @@ def _load_match(match: TextureMatch):
 
 
 def _rebuild_owned_material(settings, material):
-    from .material_builder import build_material, is_mw_material
+    from .material_builder import build_material, is_mw_material, sync_settings_from_material
 
     if is_mw_material(material):
-        build_material(settings, material=material)
+        try:
+            build_material(settings, material=material)
+        except Exception:
+            sync_settings_from_material(settings, material, force=True)
+            raise
 
 
-def apply_scan_result(settings, result: ScanResult, material=None) -> ScanResult:
+def apply_scan_result(settings, result: ScanResult, material=None, *, anchor=None) -> ScanResult:
     """Replace the detected slots while leaving every source file untouched."""
-    loaded_images = {
-        role: _load_match(match) for role, match in result.matches.items()
-    }
+    loaded_images = {}
+    for role, match in result.matches.items():
+        loaded_images[role] = anchor[1] if anchor and role == anchor[0] else _load_match(match)
     with settings_update_guard(settings):
         settings.texture_folder = str(result.folder)
         for role in TEXTURE_ROLES:
@@ -326,7 +330,7 @@ def scan_companions_from_image(settings, role: str, image, material=None):
             settings.detected_normal_convention = "UNKNOWN"
         _rebuild_owned_material(settings, material)
         return None
-    path = Path(bpy.path.abspath(filepath))
+    path = Path(bpy.path.abspath(filepath, library=image.library))
     selected_match = classify_texture_path(path)
     if role == "normal":
         settings.detected_normal_convention = _normal_convention(selected_match)
@@ -335,12 +339,13 @@ def scan_companions_from_image(settings, role: str, image, material=None):
         selected_match is None
         or selected_match.role != role
         or not settings.auto_load_companions
+        or not path.is_file()
     ):
         _rebuild_owned_material(settings, material)
         return None
 
     result = scan_texture_folder(path.parent, preferred={role: path})
-    return apply_scan_result(settings, result, material=material)
+    return apply_scan_result(settings, result, material=material, anchor=(role, image))
 
 
 def clear_texture_settings(settings, material=None, clear_folder=False):

@@ -9,6 +9,9 @@ from bpy.app.handlers import persistent
 from .material_builder import is_mw_material, sync_settings_from_material
 
 
+from .relink import missing_images
+
+
 MATERIAL_CONTEXT_PANELS = (
     "EEVEE_MATERIAL_PT_context_material",
     "CYCLES_PT_context_material",
@@ -214,6 +217,16 @@ def _draw_material_builder(layout, context):
         factor=loaded / len(TEXTURE_SLOTS),
         text=f"{loaded} of {len(TEXTURE_SLOTS)} textures loaded",
     )
+    missing = len(missing_images(material))
+    if missing:
+        summary.label(text=f"{missing} missing texture reference(s)", icon="ERROR")
+        relink = summary.row()
+        relink.operator_context = "INVOKE_DEFAULT"
+        relink.operator("mw_pbr.relink_texture_set", text="Relink Texture Set")
+    refresh = summary.row(align=True)
+    refresh.operator_context = "INVOKE_DEFAULT"
+    refresh.operator("mw_pbr.update_material")
+    refresh.operator("mw_pbr.rebuild_material")
     actions = summary.row()
     actions.operator(
         "mw_pbr.toggle_backfaces",

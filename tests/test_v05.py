@@ -16,8 +16,9 @@ import mw_pbr_material  # noqa: E402
 from mw_pbr_material import ui  # noqa: E402
 
 
-def run():
-    bpy.ops.wm.read_factory_settings(use_empty=True)
+def run(*, reset=True):
+    if reset:
+        bpy.ops.wm.read_factory_settings(use_empty=True)
     mw_pbr_material.register()
 
     mesh = bpy.data.meshes.new("MW V0.5 Test Mesh")

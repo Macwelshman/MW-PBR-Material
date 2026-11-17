@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "mw_pbr_material"
-version = "0.6.5"
+version = "0.6.6"
 name = "MW PBR Material"
 tagline = "Detect texture sets and build clean PBR materials"
 maintainer = "MacWelshman"

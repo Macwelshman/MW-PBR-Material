@@ -36,8 +36,9 @@ def _matching_material_callbacks(panel):
     ]
 
 
-def run():
-    bpy.ops.wm.read_factory_settings(use_empty=True)
+def run(*, reset=True, color="sRGB", data="Non-Color"):
+    if reset:
+        bpy.ops.wm.read_factory_settings(use_empty=True)
     mw_pbr_material.register()
 
     mesh = bpy.data.meshes.new("MW Test Mesh")
@@ -131,11 +132,11 @@ def run():
     assert material is not None
     assert material.name == "MW V0.1 Runtime Test"
     assert material["mw_pbr_material"] is True
-    assert material.use_nodes
+    assert material.node_tree is not None
     assert material.surface_render_method == "DITHERED"
 
     for role in ("base_color", "emissive"):
-        assert images[role].colorspace_settings.name == "sRGB"
+        assert images[role].colorspace_settings.name == color
     for role in (
         "metallic",
         "roughness",
@@ -144,7 +145,7 @@ def run():
         "height",
         "ambient_occlusion",
     ):
-        assert images[role].colorspace_settings.name == "Non-Color", (
+        assert images[role].colorspace_settings.name == data, (
             role,
             images[role].colorspace_settings.name,
         )
